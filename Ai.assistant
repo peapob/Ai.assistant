@@ -1,0 +1,129 @@
+import os
+import yaml
+import requests
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
+
+client = OpenAI()
+GITHUB_API = "https://api.github.com"
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_OWNER = os.getenv("GITHUB_OWNER")
+GITHUB_REPO = os.getenv("GITHUB_REPO")
+
+
+def load_personality(path="personality.yaml"):
+    with open(path, "r", encoding="utf-8") as file:
+        return yaml.safe_load(file)
+
+
+def build_system_prompt(persona):
+    tone = persona.get("tone", {})
+    rules = "\n".join(f"- {rule}" for rule in persona.get("rules", []))
+    expertise = ", ".join(persona.get("expertise", []))
+
+    return f"""You are {persona['name']}, a {persona['role']}.
+
+Communication style:
+- Tone: {tone.get('style', 'helpful and clear')}
+- Humor: {tone.get('humor', 'minimal')}
+- Formality: {tone.get('formality', 'professional')}
+
+Expertise:
+{expertise}
+
+Operating rules:
+{rules}
+
+When GitHub tools are relevant, use them carefully. Confirm before creating,
+updating, or deleting GitHub resources when the user has not clearly requested it.
+"""
+
+
+def github_headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def list_open_issues(state="open", limit=10):
+    url = f"{GITHUB_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/issues"
+    response = requests.get(
+        url,
+        headers=github_headers(),
+        params={"state": state, "per_page": limit},
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    issues = response.json()
+    return [
+        {
+            "number": issue["number"],
+            "title": issue["title"],
+            "url": issue["html_url"],
+        }
+        for issue in issues
+        if "pull_request" not in issue
+    ]
+
+
+def create_issue(title, body=""):
+    url = f"{GITHUB_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/issues"
+    response = requests.post(
+        url,
+        headers=github_headers(),
+        json={"title": title, "body": body},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()["html_url"]
+
+
+def get_assistant_reply(history, user_message, persona):
+    messages = [{"role": "system", "content": build_system_prompt(persona)}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_message})
+
+    response = client.chat.completions.create(
+        model="gpt-5.5",
+        messages=messages,
+    )
+
+    return response.choices[0].message.content
+
+
+def main():
+    persona = load_personality()
+    history = []
+
+    print(f"{persona['name']} is ready. Type 'exit' to quit.\n")
+
+    while True:
+        user_message = input("You: ").strip()
+
+        if user_message.lower() in {"exit", "quit"}:
+            break
+
+        if user_message.lower().startswith("/issues"):
+            for issue in list_open_issues():
+                print(f"#{issue['number']}: {issue['title']}\n{issue['url']}")
+            continue
+
+        if user_message.lower().startswith("/issue "):
+            title = user_message[len("/issue "):]
+            print("Creating issue:", create_issue(title, ""))
+            continue
+
+        reply = get_assistant_reply(history, user_message, persona)
+        print(f"\n{persona['name']}: {reply}\n")
+
+        history.append({"role": "user", "content": user_message})
+        history.append({"role": "assistant", "content": reply})
+
+
+if __name__ == "__main__":
+    main()
